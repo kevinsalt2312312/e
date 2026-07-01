@@ -4,11 +4,12 @@ import os
 import time
 from collections import defaultdict, deque
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 
@@ -17,6 +18,7 @@ PREFIX = "$"
 CONTROL_ROLE_ID = 1521554937266311382
 QUARANTINE_ROLE_ID = 1472343485712433199
 ANTINUKE_LOG_CHANNEL_ID = 1519446896664641657
+FLOP_LOG_CHANNEL_ID = 1519412904418607376
 
 DATA_DIR = Path(os.getenv("ANTINUKE_DATA_DIR", "antinuke_data"))
 ASSET_DIR = DATA_DIR / "assets"
@@ -24,10 +26,19 @@ BACKUP_FILE = DATA_DIR / "backup.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 LOG_FILE = DATA_DIR / "logs.json"
 ROLE_CACHE_FILE = DATA_DIR / "role_cache.json"
+FLOP_FILE = DATA_DIR / "flops.json"
 
 AUDIT_LOOKBACK_SECONDS = 12
 QUARANTINE_REASON = "Anti-Nuke: unauthorized protected action"
 MAX_LOGS = 500
+FLOP_PAGE_SIZE = 10
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+PERIOD_CHOICES = [
+    app_commands.Choice(name="day", value="day"),
+    app_commands.Choice(name="week", value="week"),
+    app_commands.Choice(name="month", value="month"),
+    app_commands.Choice(name="all time", value="all time"),
+]
 
 DANGEROUS_PERMISSION_NAMES = {
     "administrator",
@@ -180,6 +191,7 @@ state: dict[str, Any] = {
     "backup": {},
     "logs": [],
     "role_cache": {},
+    "flops": [],
     "recent_messages": defaultdict(lambda: defaultdict(lambda: deque(maxlen=8))),
     "recent_mod_actions": defaultdict(lambda: defaultdict(lambda: deque(maxlen=10))),
     "restoring": set(),
@@ -227,6 +239,8 @@ def ensure_data_files() -> None:
         LOG_FILE.write_text("[]", encoding="utf-8")
     if not ROLE_CACHE_FILE.exists():
         ROLE_CACHE_FILE.write_text("{}", encoding="utf-8")
+    if not FLOP_FILE.exists():
+        FLOP_FILE.write_text("[]", encoding="utf-8")
 
 
 def load_json(path: Path, fallback: Any) -> Any:
@@ -807,6 +821,317 @@ async def delete_created_role(role: discord.Role) -> str:
         return f"Failed: {exc}"
 
 
+def save_flops() -> None:
+    save_json(FLOP_FILE, state["flops"])
+
+
+def period_label(period: str) -> str:
+    labels = {
+        "day": "Past Day",
+        "week": "Past Week",
+        "month": "Past Month",
+        "all time": "All Time",
+    }
+    return labels.get(period, "All Time")
+
+
+def period_cutoff(period: str) -> Optional[datetime]:
+    now = datetime.now(timezone.utc)
+    if period == "day":
+        return now - timedelta(days=1)
+    if period == "week":
+        return now - timedelta(days=7)
+    if period == "month":
+        return now - timedelta(days=30)
+    return None
+
+
+def parse_flop_time(value: str) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def filtered_flops(guild_id: int, period: str, trader_id: Optional[int] = None) -> list[dict[str, Any]]:
+    cutoff = period_cutoff(period)
+    results: list[dict[str, Any]] = []
+    for flop in state["flops"]:
+        if int(flop.get("guild_id", 0)) != guild_id:
+            continue
+        if trader_id is not None and int(flop.get("trader_id", 0)) != trader_id:
+            continue
+        created_at = parse_flop_time(flop.get("created_at", ""))
+        if cutoff is not None and (created_at is None or created_at < cutoff):
+            continue
+        results.append(flop)
+    return sorted(results, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+def image_is_valid(attachment: discord.Attachment) -> bool:
+    filename = attachment.filename.lower()
+    content_type = (attachment.content_type or "").lower()
+    return content_type.startswith("image/") or any(filename.endswith(ext) for ext in IMAGE_EXTENSIONS)
+
+
+def can_use_flop_commands(member: discord.Member) -> bool:
+    return can_use_commands(member)
+
+
+async def require_flop_permission(interaction: discord.Interaction) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return False
+    if can_use_flop_commands(interaction.user):
+        return True
+    await interaction.response.send_message("You are not allowed to use flop commands.", ephemeral=True)
+    return False
+
+
+async def send_flop_log(guild: discord.Guild, embed: discord.Embed) -> None:
+    channel = guild.get_channel(FLOP_LOG_CHANNEL_ID)
+    if isinstance(channel, discord.TextChannel):
+        await channel.send(embed=embed)
+
+
+def make_flop_embed(
+    trader: discord.Member,
+    middleman: discord.Member,
+    trade: str,
+    split: str,
+    notes: Optional[str],
+    image_url: str,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="Flop Logged",
+        description="A flop has been successfully logged.",
+        colour=discord.Colour.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Trader", value=trader.mention, inline=False)
+    embed.add_field(name="Middleman", value=middleman.mention, inline=False)
+    embed.add_field(name="Trade", value=trade[:1024], inline=False)
+    embed.add_field(name="Split", value=split[:1024], inline=False)
+    embed.add_field(name="Extra Notes", value=(notes or "None")[:1024], inline=False)
+    embed.set_image(url=image_url)
+    embed.set_footer(text="Grow A Garden 2 | MM Services")
+    return embed
+
+
+def make_flop_count_embed(guild: discord.Guild, period: str) -> discord.Embed:
+    flops = filtered_flops(guild.id, period)
+    embed = discord.Embed(
+        title=f"Flop Count ({period_label(period)})",
+        colour=discord.Colour.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.description = f"Total flops: **{len(flops)}**"
+    embed.set_footer(text="Grow A Garden 2 | MM Services")
+    return embed
+
+
+def make_flop_leaderboard_embed(guild: discord.Guild, period: str, page: int) -> discord.Embed:
+    counts: dict[int, int] = defaultdict(int)
+    for flop in filtered_flops(guild.id, period):
+        counts[int(flop["trader_id"])] += 1
+
+    ranking = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    pages = max(1, (len(ranking) + FLOP_PAGE_SIZE - 1) // FLOP_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * FLOP_PAGE_SIZE
+    shown = ranking[start : start + FLOP_PAGE_SIZE]
+
+    lines = []
+    for index, (user_id, count) in enumerate(shown, start=start + 1):
+        member = guild.get_member(user_id)
+        name = member.mention if member else f"<@{user_id}>"
+        suffix = "flop" if count == 1 else "flops"
+        lines.append(f"**{index}.** {name}: **{count}** {suffix}")
+
+    embed = discord.Embed(
+        title=f"Flop Leaderboard ({period_label(period)})",
+        description="\n".join(lines) if lines else "No flops logged for this period.",
+        colour=discord.Colour.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Grow A Garden 2 | MM Services - Page {page + 1}/{pages}")
+    return embed
+
+
+def make_view_flops_embed(guild: discord.Guild, user: discord.Member, period: str, page: int) -> discord.Embed:
+    flops = filtered_flops(guild.id, period, user.id)
+    pages = max(1, (len(flops) + FLOP_PAGE_SIZE - 1) // FLOP_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * FLOP_PAGE_SIZE
+    shown = flops[start : start + FLOP_PAGE_SIZE]
+
+    lines = []
+    for index, flop in enumerate(shown, start=start + 1):
+        middleman_id = int(flop.get("middleman_id", 0))
+        middleman = guild.get_member(middleman_id)
+        middleman_text = middleman.mention if middleman else f"<@{middleman_id}>"
+        notes = flop.get("notes") or "None"
+        image_url = flop.get("image_url", "")
+        lines.append(
+            f"**{index}.** Trade: {flop.get('trade', 'Unknown')}\n"
+            f"Split: {flop.get('split', 'Unknown')}\n"
+            f"Middleman: {middleman_text}\n"
+            f"Notes: {notes}\n"
+            f"Proof: {image_url}"
+        )
+
+    embed = discord.Embed(
+        title=f"Flops for {user.display_name} ({period_label(period)})",
+        description="\n\n".join(lines) if lines else "No flops found for this period.",
+        colour=discord.Colour.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Total", value=str(len(flops)), inline=True)
+    embed.set_footer(text=f"Grow A Garden 2 | MM Services - Page {page + 1}/{pages}")
+    return embed
+
+
+class FlopLeaderboardView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, period: str, requester_id: int):
+        super().__init__(timeout=120)
+        self.guild = guild
+        self.period = period
+        self.requester_id = requester_id
+        self.page = 0
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message("Only the command user can use these buttons.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(embed=make_flop_leaderboard_embed(self.guild, self.period, self.page), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page += 1
+        await interaction.response.edit_message(embed=make_flop_leaderboard_embed(self.guild, self.period, self.page), view=self)
+
+
+class ViewFlopsView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user: discord.Member, period: str, requester_id: int):
+        super().__init__(timeout=120)
+        self.guild = guild
+        self.user = user
+        self.period = period
+        self.requester_id = requester_id
+        self.page = 0
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message("Only the command user can use these buttons.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(embed=make_view_flops_embed(self.guild, self.user, self.period, self.page), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page += 1
+        await interaction.response.edit_message(embed=make_view_flops_embed(self.guild, self.user, self.period, self.page), view=self)
+
+
+@bot.tree.command(name="flop", description="Log a flop against a trader.")
+@app_commands.describe(
+    trader="The trader/flopper who gets the flop counted.",
+    trade="The trade details.",
+    split="The split agreement.",
+    notes="Optional extra notes.",
+    image="Required proof image, such as a Mercy screenshot or in-game screenshot.",
+)
+async def flop_command(
+    interaction: discord.Interaction,
+    trader: discord.Member,
+    trade: str,
+    split: str,
+    image: discord.Attachment,
+    notes: Optional[str] = None,
+) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+    if not await require_flop_permission(interaction):
+        return
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("This command can only be used by a server member.", ephemeral=True)
+        return
+    if trader.bot:
+        await interaction.response.send_message("You cannot log a flop against a bot.", ephemeral=True)
+        return
+    if not image_is_valid(image):
+        await interaction.response.send_message("The image option must be an image attachment.", ephemeral=True)
+        return
+
+    record = {
+        "guild_id": interaction.guild.id,
+        "trader_id": trader.id,
+        "middleman_id": interaction.user.id,
+        "trade": trade,
+        "split": split,
+        "notes": notes or "",
+        "image_url": image.url,
+        "created_at": utc_now(),
+    }
+    state["flops"].append(record)
+    save_flops()
+
+    embed = make_flop_embed(trader, interaction.user, trade, split, notes, image.url)
+    await send_flop_log(interaction.guild, embed)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="flopcount", description="Show total flops for a period.")
+@app_commands.describe(period="The time period to count.")
+@app_commands.choices(period=PERIOD_CHOICES)
+async def flopcount_command(interaction: discord.Interaction, period: app_commands.Choice[str]) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+    embed = make_flop_count_embed(interaction.guild, period.value)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="floplb", description="Show the flop leaderboard for a period.")
+@app_commands.describe(period="The time period to rank.")
+@app_commands.choices(period=PERIOD_CHOICES)
+async def floplb_command(interaction: discord.Interaction, period: app_commands.Choice[str]) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+    view = FlopLeaderboardView(interaction.guild, period.value, interaction.user.id)
+    embed = make_flop_leaderboard_embed(interaction.guild, period.value, 0)
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+@bot.tree.command(name="viewflops", description="View flops logged against a specific trader.")
+@app_commands.describe(
+    user="The trader/flopper to look up.",
+    period="The time period to search.",
+)
+@app_commands.choices(period=PERIOD_CHOICES)
+async def viewflops_command(interaction: discord.Interaction, user: discord.Member, period: app_commands.Choice[str]) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+    view = ViewFlopsView(interaction.guild, user, period.value, interaction.user.id)
+    embed = make_view_flops_embed(interaction.guild, user, period.value, 0)
+    await interaction.response.send_message(embed=embed, view=view)
+
+
 @bot.event
 async def on_ready() -> None:
     ensure_data_files()
@@ -814,10 +1139,16 @@ async def on_ready() -> None:
     state["backup"] = load_json(BACKUP_FILE, {})
     state["logs"] = load_json(LOG_FILE, [])
     state["role_cache"] = load_json(ROLE_CACHE_FILE, {})
+    state["flops"] = load_json(FLOP_FILE, [])
     for guild in bot.guilds:
         await make_backup(guild)
     if not backup_loop.is_running():
         backup_loop.start()
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash command(s).")
+    except discord.HTTPException as exc:
+        print(f"Failed to sync slash commands: {exc}")
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 
@@ -1330,7 +1661,8 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}on`, `{PREFIX}off`, `{PREFIX}status`, `{PREFIX}logs [limit]`, `{PREFIX}restore`, "
         f"`{PREFIX}config`, `{PREFIX}config set <protection> <on/off>`, "
         f"`{PREFIX}quarantine @user`, `{PREFIX}unquarantine @user`, "
-        f"`{PREFIX}whitelist add/remove/list`"
+        f"`{PREFIX}whitelist add/remove/list`\n"
+        "`/flop`, `/flopcount`, `/floplb`, `/viewflops`"
     )
     await ctx.reply(commands_text, mention_author=False)
 
